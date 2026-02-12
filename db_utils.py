@@ -1,0 +1,26 @@
+import subprocess
+import logging
+
+def get_databases_by_size(instance_name, host, user, password, use_ssl, ssl_path):
+    query = (
+        "SELECT table_schema, SUM(data_length + index_length) / 1024 / 1024 AS size_mb "
+        "FROM information_schema.TABLES "
+        "WHERE table_schema NOT IN ('mysql', 'information_schema', 'performance_schema', 'sys') "
+        "GROUP BY table_schema ORDER BY size_mb ASC;"
+    )
+    cmd = ["mysql", f"-u{user}", f"-p{password}", f"-h{host}", "-B", "--silent", "-N", "-e", query]
+    
+    if use_ssl:
+        cmd += [f"--ssl-ca={ssl_path}/server-ca.pem", f"--ssl-cert={ssl_path}/client-cert.pem", f"--ssl-key={ssl_path}/client-key.pem"]
+
+    try:
+        result = subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode("utf-8")
+        return [line.split('\t')[0] for line in result.strip().split('\n') if line]
+    except Exception as e:
+        logging.warning(f"Size-sorting failed for {instance_name}, falling back to default list: {e}")
+        return fallback_list(instance_name)
+
+def fallback_list(instance):
+    cmd = ["gcloud", "sql", "databases", "list", f"--instance={instance}", "--format=value(name)"]
+    res = subprocess.check_output(cmd).decode("utf-8").strip().split('\n')
+    return [d for d in res if d not in ("information_schema", "performance_schema", "sys", "mysql")]
