@@ -8,11 +8,12 @@ def authenticate(key_file):
                    check=True, capture_output=True)
 
 def run_export(instance, database, target_uri, project_id):
-    """Triggers export and polls accurately by filtering for the Operation ID."""
+    # We add --verbosity=error to kill those DEBUG messages 
     cmd = [
         "gcloud", "sql", "export", "sql", instance, target_uri,
         f"--database={database}", "--offload", "--quiet",
-        f"--project={project_id}", "--format=value(name)"
+        f"--project={project_id}", "--format=value(name)",
+        "--verbosity=error" 
     ]
     
     start_time = time.time()
