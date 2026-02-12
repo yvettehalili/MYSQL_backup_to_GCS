@@ -5,67 +5,70 @@ import configparser
 from concurrent.futures import ThreadPoolExecutor
 from lib import gcp_utils, db_utils, cleanup_utils, notifier
 
-# --- Configuration Paths (Server Side) ---
+# --- CONFIGURATION ---
+MAX_WORKERS = 2 
 CONFIG_DIR = "/backup/configs"
 KEY_FILE = "/root/jsonfiles/ti-dba-prod-01.json"
-SSL_BASE_PATH = "/ssl-certs"
-LOG_PATH = "/backup/logs"
-MAX_WORKERS = 2  # SRE Safe-Start parallel instances
+BUCKET = "gs://ti-dba-bucket"
+GCS_PATH = "Backups/Current/MYSQL"
+LOG_DIR = "/backup/logs"
 
-# Setup Logging
-os.makedirs(LOG_PATH, exist_ok=True)
+# Setup logging with thread names to track parallel execution
 current_date = datetime.datetime.now().strftime("%Y-%m-%d")
 logging.basicConfig(
-    filename=f"{LOG_PATH}/MYSQL_backup_{current_date}.log",
+    filename=f"{LOG_DIR}/MYSQL_backup_{current_date}.log",
     level=logging.INFO,
     format='%(asctime)s %(levelname)s [%(threadName)s]: %(message)s'
 )
 
-def process_instance(instance_name, cfg, db_creds):
-    """The task for each thread: Backup one instance's databases in order of size."""
+def process_instance(instance_name, config, db_creds):
+    """Function executed by each thread for a specific Cloud SQL instance."""
     try:
-        host = cfg[instance_name]['host']
-        use_ssl = cfg[instance_name].get('ssl', 'n').lower() == 'y'
-        ssl_path = os.path.join(SSL_BASE_PATH, instance_name)
+        host = config[instance_name]['host']
+        use_ssl = config[instance_name].get('ssl', 'n').lower() == 'y'
+        ssl_path = f"/ssl-certs/{instance_name}"
         
-        # 1. Get DBs sorted smallest-to-largest
+        # 1. Discover Databases and sort by Smallest First
         dbs = db_utils.get_databases_by_size(
             instance_name, host, 
             db_creds['DB_USR'], db_creds['DB_PWD'], 
             use_ssl, ssl_path
         )
-
-        # 2. Sequential Export
+        
+        # 2. Sequential Export for databases within THIS instance
         for db in dbs:
-            target_uri = f"gs://ti-dba-prod-sql-01/Backups/Current/MYSQL/{instance_name}/{current_date}_{db}.sql.gz"
-            duration = gcp_utils.run_export(instance_name, db, target_uri)
-            logging.info(f"SUCCESS: {instance_name} | {db} | Duration: {duration:.2f}s")
-            
+            try:
+                logging.info(f"STARTING EXPORT: {instance_name} | DB: {db}")
+                duration = gcp_utils.run_export(instance_name, db, BUCKET, GCS_PATH, current_date)
+                logging.info(f"SUCCESS: {instance_name} | {db} | Duration: {duration:.2f}s")
+            except Exception as e:
+                logging.error(f"DATABASE ERROR: {instance_name} | {db} | {e}")
+                
     except Exception as e:
-        logging.error(f"CRITICAL ERROR on Instance {instance_name}: {str(e)}")
+        logging.error(f"INSTANCE CRITICAL ERROR: {instance_name} | {e}")
         notifier.send_error(instance_name, str(e))
 
 def main():
-    logging.info("==== STARTING CLOUD SQL BACKUP PIPELINE ====")
+    logging.info("==== MYSQL BACKUP PIPELINE STARTING ====")
     
-    # Authenticate and Cleanup Housekeeping
+    # Housekeeping: Cleanup old logs and Authenticate GCP
+    cleanup_utils.cleanup_logs(LOG_DIR, 30)
     gcp_utils.authenticate(KEY_FILE)
-    cleanup_utils.cleanup_logs(LOG_PATH, 30)
 
-    # Load Server Configurations
+    # Load Infrastructure Config and DB Credentials
     cfg = configparser.ConfigParser()
-    cfg.read(os.path.join(CONFIG_DIR, "MYSQL_servers_list.conf"))
+    cfg.read(f"{CONFIG_DIR}/MYSQL_servers_list.conf")
     
     creds = configparser.ConfigParser()
-    creds.read(os.path.join(CONFIG_DIR, "db_credentials.conf"))
+    creds.read(f"{CONFIG_DIR}/db_credentials.conf")
     db_creds = creds['credentials']
 
-    # Parallel Execution
+    # Parallel Execution Logic
     with ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="SRE_Worker") as executor:
         for instance in cfg.sections():
             executor.submit(process_instance, instance, cfg, db_creds)
 
-    logging.info("==== PIPELINE COMPLETED SUCCESSFULLY ====")
+    logging.info("==== MYSQL BACKUP PIPELINE FINISHED ====")
 
 if __name__ == "__main__":
     main()
