@@ -22,36 +22,43 @@ logging.basicConfig(
 )
 
 def process_instance(instance_name, cfg, db_creds):
-    """Sequential export of databases for a specific instance."""
+    """Processes databases for an instance, continuing on individual failures."""
     try:
         host = cfg[instance_name]['host']
-        # Project ID discovery (defaults to prod if not specified)
         project_id = cfg[instance_name].get('project', 'ti-dba-prod-01')
+        bucket = cfg[instance_name].get('bucket', 'ti-dba-bucket')
+        base_path = cfg[instance_name].get('base_path', 'Backups/Current/MYSQL')
         use_ssl = cfg[instance_name].get('ssl', 'n').lower() == 'y'
         ssl_path = os.path.join(SSL_BASE_PATH, instance_name)
         
-        # 1. Fetch databases sorted by size (Smallest first)
+        # Get list of databases
         dbs = db_utils.get_databases_by_size(
             instance_name, host, 
             db_creds['DB_USR'], db_creds['DB_PWD'], 
             use_ssl, ssl_path
         )
 
-        # 2. Loop through databases (Wait for each to finish before next)
         for db in dbs:
-            target_uri = f"gs://ti-dba-prod-sql-01/Backups/Current/MYSQL/{instance_name}/{current_date}_{db}.sql.gz"
-            logging.info(f"Initiating: {instance_name} -> {db}")
-            
-            duration = gcp_utils.run_export(instance_name, db, target_uri, project_id)
-            
-            logging.info(f"COMPLETED: {instance_name} | {db} | Time: {duration:.2f}s")
-            
+            try:
+                target_uri = f"gs://{bucket}/{base_path}/{instance_name}/{current_date}_{db}.sql.gz"
+                logging.info(f"Initiating: {instance_name} -> {db}")
+                
+                # Execute export
+                duration = gcp_utils.run_export(instance_name, db, target_uri, project_id)
+                logging.info(f"SUCCESS: {instance_name} | {db} | Time: {duration:.2f}s")
+                
+            except Exception as e:
+                # CRITICAL: This allows the loop to move to the next DB if one fails
+                logging.error(f"DATABASE FAILED: {db} on {instance_name}. Error: {str(e)}")
+                notifier.send_error(f"{instance_name} - {db}", str(e))
+                continue 
+
     except Exception as e:
-        logging.error(f"CRITICAL ERROR on {instance_name}: {str(e)}")
-        notifier.send_error(instance_name, str(e))
+        logging.error(f"INSTANCE FATAL ERROR {instance_name}: {str(e)}")
+        notifier.send_error(instance_name, f"Fatal error fetching DB list: {str(e)}")
 
 def main():
-    logging.info("==== STARTING BACKUP PIPELINE (POLLING MODE) ====")
+    logging.info("==== STARTING BACKUP PIPELINE (ROBUST MODE) ====")
     gcp_utils.authenticate(KEY_FILE)
     cleanup_utils.cleanup_logs(LOG_PATH, 30)
 

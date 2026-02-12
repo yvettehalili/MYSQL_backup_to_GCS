@@ -8,26 +8,29 @@ def authenticate(key_file):
                    check=True, capture_output=True)
 
 def run_export(instance, database, target_uri, project_id):
-    # We add --verbosity=error to kill those DEBUG messages 
+    """Triggers export and handles both instant and long-running operations."""
     cmd = [
         "gcloud", "sql", "export", "sql", instance, target_uri,
         f"--database={database}", "--offload", "--quiet",
-        f"--project={project_id}", "--format=value(name)",
-        "--verbosity=error" 
+        f"--project={project_id}", "--format=value(name)", "--verbosity=error"
     ]
     
     start_time = time.time()
     try:
-        # We use stderr=subprocess.STDOUT to merge warnings so we can handle them
+        # Capture the output from gcloud
         result = subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode("utf-8").strip()
         
-        # Get the LAST line of the output (which will be the ID, skipping pricing warnings)
-        operation_id = result.splitlines()[-1] 
-        
-        if not operation_id:
-            raise Exception("Could not retrieve Operation ID from gcloud output.")
+        # Take the last line to avoid pricing warnings or SDK debug noise
+        last_line = result.splitlines()[-1]
 
-        logging.info(f"Started export for {database}. Op ID: {operation_id}")
+        # CASE 1: Instant Success (Common for tiny databases)
+        if "Exported" in last_line:
+            logging.info(f"Instant export success for {database}.")
+            return time.time() - start_time
+
+        # CASE 2: Long-running Export (We have a real Operation ID)
+        operation_id = last_line
+        logging.info(f"Started polling for {database}. Op ID: {operation_id}")
 
         while True:
             check_cmd = [
@@ -39,12 +42,11 @@ def run_export(instance, database, target_uri, project_id):
             if status == "DONE":
                 return time.time() - start_time
             elif status == "FAILED":
-                raise Exception(f"GCP Operation {operation_id} failed on the server side.")
+                raise Exception(f"GCP Operation {operation_id} failed on server side.")
             
+            # Wait 30 seconds between checks
             time.sleep(30)
             
     except subprocess.CalledProcessError as e:
-        # Extract the actual error message from the failed command
-        error_output = e.output.decode("utf-8") if e.output else str(e)
-        logging.error(f"Failed to initiate export: {error_output}")
-        raise
+        error_msg = e.output.decode("utf-8") if e.output else str(e)
+        raise Exception(f"Gcloud initiation failed: {error_msg}")
